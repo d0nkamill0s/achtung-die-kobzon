@@ -215,8 +215,7 @@ export default function Moving() {
 
             if (key === CONFIG.INPUT.restartKey) {
                 event.preventDefault();
-                if (!gameOverText) return; // restart tylko po zakończeniu
-                restartGame();
+                restartGame(); // 🔁 restart zawsze: czyści planszę i losuje pozycje
                 return;
             }
 
