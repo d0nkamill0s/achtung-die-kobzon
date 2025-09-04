@@ -310,6 +310,7 @@ export default function Moving() {
 
         // --- Pętla gry ---
         let lastTimestampMs = performance.now();
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         let hudAccumulatedMs = 0;
 
         const step = (nowMs: number) => {
