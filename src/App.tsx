@@ -11,6 +11,7 @@ const CONFIG = {
         playerTwoHex: "#ffd166",
         hudTextHex: "#d7e0f2",
         hudDimHex: "#9aa7bf",
+        borderHex: "#75D4E6", // kolor ramki
     },
     DOT: {
         radiusPixels: 2,
@@ -20,7 +21,7 @@ const CONFIG = {
         turnSpeedRadiansPerSecond: Math.PI / 2,
     },
     INPUT: {
-        toggleMovementKey: " ",
+        toggleMovementKey: " ", // SPACE
         playerOneTurnLeftKey: "a",
         playerOneTurnRightKey: "d",
         playerTwoTurnLeftKey: "j",
@@ -29,10 +30,23 @@ const CONFIG = {
     },
     TRAIL: {
         recentIgnoreFrameCount: 10,
-        extraIgnoreMarginPixels: 0.75,
+        extraIgnoreMarginPixels: 0.75, // promień „świeżego” ogona ignorowanego przy kolizji
     },
     SCORING: {
-        hudRefreshIntervalMs: 100, // jak często odświeżać HUD (mniejsze obciążenie niż co klatkę)
+        hudRefreshIntervalMs: 100,
+    },
+    GAPS: {
+        enabled: true,
+        minIntervalSeconds: 1.2,
+        maxIntervalSeconds: 3.0,
+        minDurationSeconds: 0.18,
+        maxDurationSeconds: 0.35,
+        corridorExtraMarginPixels: 0.6,
+        corridorMaxPoints: 600,
+    },
+    BORDER: {
+        thicknessPixels: 4, // grubość ramki
+        insetPixels: 4,     // odsunięcie ramki od krawędzi canvasa (żeby była w pełni widoczna)
     },
 } as const;
 
@@ -40,20 +54,34 @@ const CONFIG = {
  * 2) Typy
  * ========================= */
 type Vector2D = { x: number; y: number };
-type TrailMask = { widthPixels: number; heightPixels: number; occupancy: Uint8Array };
+
+type TrailMask = {
+    widthPixels: number;
+    heightPixels: number;
+    occupancy: Uint8Array; // 1 = zajęty piksel śladu, 0 = wolny
+};
+
+type GapState = {
+    isActive: boolean;
+    timeUntilNextGap: number; // s
+    remainingGapTime: number; // s
+};
 
 type PlayerState = {
     label: "Player 1" | "Player 2";
     colorHex: string;
     angleRadians: number;
     positionPixels: Vector2D;
-    recentPositions: Vector2D[];
+    recentPositions: Vector2D[]; // świeży ogon (dla ignorowania kolizji)
+    gapCorridor: Vector2D[];     // punkty korytarza w trakcie dziury (dla wszystkich)
     isAlive: boolean;
     scoreSeconds: number;
+    gap: GapState;
+    lastRenderedPosition?: Vector2D;
 };
 
 /* ==================================
- * 3) Utilsy: ślad, rysowanie
+ * 3) Utilsy: ślad, kolizje, losowanie, rysowanie
  * ================================== */
 function createTrailMask(widthPixels: number, heightPixels: number): TrailMask {
     return {widthPixels, heightPixels, occupancy: new Uint8Array(widthPixels * heightPixels)};
@@ -86,11 +114,15 @@ function markVisitedCircle(
     }
 }
 
-function collidesWithTrailExcludingRecent(
+/**
+ * Sprawdza kolizję okręgu z maską śladu, ignorując punkty z `ignoredPoints`
+ * w promieniu `extraIgnoreMarginPixels`.
+ */
+function collidesWithTrailExcludingPoints(
     trailMask: TrailMask,
     center: Vector2D,
     radiusPixels: number,
-    recentPositionsToIgnore: Vector2D[],
+    ignoredPoints: Vector2D[],
     extraIgnoreMarginPixels: number
 ): boolean {
     const minX = Math.max(0, Math.floor(center.x - radiusPixels));
@@ -113,19 +145,18 @@ function collidesWithTrailExcludingRecent(
             if (distanceSquared > radiusSquared) continue;
 
             if (trailMask.occupancy[rowOffset + pixelX] === 1) {
-                // ignoruj tylko własny świeży ogon
-                let belongsToIgnoredRecent = false;
-                for (let i = 0; i < recentPositionsToIgnore.length; i++) {
-                    const rp = recentPositionsToIgnore[i];
-                    const deltaRecentX = pixelX - rp.x;
-                    const deltaRecentY = pixelY - rp.y;
-                    const distanceToRecentSquared = deltaRecentX * deltaRecentX + deltaRecentY * deltaRecentY;
-                    if (distanceToRecentSquared <= ignoreRadiusSquared) {
-                        belongsToIgnoredRecent = true;
+                // Czy piksel należy do jednego z ignorowanych punktów?
+                let belongsToIgnored = false;
+                for (let i = 0; i < ignoredPoints.length; i++) {
+                    const p = ignoredPoints[i];
+                    const dx = pixelX - p.x;
+                    const dy = pixelY - p.y;
+                    if (dx * dx + dy * dy <= ignoreRadiusSquared) {
+                        belongsToIgnored = true;
                         break;
                     }
                 }
-                if (!belongsToIgnoredRecent) return true;
+                if (!belongsToIgnored) return true;
             }
         }
     }
@@ -144,14 +175,98 @@ function drawDot(
     ctx.fill();
 }
 
+function drawHeadWithGap(
+    ctx: CanvasRenderingContext2D,
+    player: PlayerState,
+    radiusPixels: number
+): void {
+    if (CONFIG.GAPS.enabled && player.gap.isActive && player.lastRenderedPosition) {
+        ctx.beginPath();
+        ctx.arc(
+            player.lastRenderedPosition.x,
+            player.lastRenderedPosition.y,
+            radiusPixels,
+            0,
+            Math.PI * 2
+        );
+        ctx.fillStyle = CONFIG.COLORS.backgroundHex;
+        ctx.fill();
+    }
+    drawDot(ctx, player.positionPixels, radiusPixels, player.colorHex);
+    player.lastRenderedPosition = {x: player.positionPixels.x, y: player.positionPixels.y};
+}
+
+function randomInRange(min: number, max: number) {
+    return min + Math.random() * (max - min);
+}
+
+function initGapState(): GapState {
+    return {
+        isActive: false,
+        timeUntilNextGap: randomInRange(CONFIG.GAPS.minIntervalSeconds, CONFIG.GAPS.maxIntervalSeconds),
+        remainingGapTime: 0,
+    };
+}
+
+function updateGap(gap: GapState, deltaTimeSeconds: number) {
+    if (!CONFIG.GAPS.enabled) return;
+    if (gap.isActive) {
+        gap.remainingGapTime -= deltaTimeSeconds;
+        if (gap.remainingGapTime <= 0) {
+            gap.isActive = false;
+            gap.timeUntilNextGap = randomInRange(
+                CONFIG.GAPS.minIntervalSeconds,
+                CONFIG.GAPS.maxIntervalSeconds
+            );
+        }
+    } else {
+        gap.timeUntilNextGap -= deltaTimeSeconds;
+        if (gap.timeUntilNextGap <= 0) {
+            gap.isActive = true;
+            gap.remainingGapTime = randomInRange(
+                CONFIG.GAPS.minDurationSeconds,
+                CONFIG.GAPS.maxDurationSeconds
+            );
+        }
+    }
+}
+
+/** Rysuje ramkę na krawędziach pola gry. */
+function drawBorder(ctx: CanvasRenderingContext2D, width: number, height: number) {
+    const t = CONFIG.BORDER.thicknessPixels;
+    const inset = CONFIG.BORDER.insetPixels;
+    ctx.fillStyle = CONFIG.COLORS.borderHex;
+    // top
+    ctx.fillRect(inset, inset, width - 2 * inset, t);
+    // bottom
+    ctx.fillRect(inset, height - inset - t, width - 2 * inset, t);
+    // left
+    ctx.fillRect(inset, inset, t, height - 2 * inset);
+    // right
+    ctx.fillRect(width - inset - t, inset, t, height - 2 * inset);
+}
+
+/** Sprawdza, czy okrąg o środku (x,y) i promieniu r uderza w ramkę. */
+function hitsBorder(x: number, y: number, width: number, height: number, radius: number): boolean {
+    const t = CONFIG.BORDER.thicknessPixels;
+    const inset = CONFIG.BORDER.insetPixels;
+
+    // Wewnętrzny „bezpieczny” prostokąt, w którym może poruszać się środek kropki
+    const minX = inset + t + radius;
+    const maxX = width - inset - t - radius;
+    const minY = inset + t + radius;
+    const maxY = height - inset - t - radius;
+
+    return x < minX || x > maxX || y < minY || y > maxY;
+}
+
 /* =========================
- * 4) Komponent
+ * 4) Komponent + HUD + restart
  * ========================= */
 export default function Moving() {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const animationFrameRef = useRef<number | null>(null);
 
-    // HUD (prosty stan do wyświetlania punktów i komunikatów)
     const [hud, setHud] = useState<{
         playerOneScore: number;
         playerTwoScore: number;
@@ -162,24 +277,26 @@ export default function Moving() {
     useEffect(() => {
         const canvasElement = canvasRef.current;
         if (!canvasElement) return;
-
         const canvasContext = canvasElement.getContext("2d");
         if (!canvasContext) return;
 
-        // --- Stan globalny gry ---
+        // --- Stan globalny rundy ---
         let isMoving = false;
-        let gameOverText = ""; // "Player 1 crashed", "Player 2 crashed", "Both crashed"
-        let trailMask = createTrailMask(1, 1);
+        let hasRoundEnded = false;
+        let trailMask: TrailMask = createTrailMask(1, 1);
 
-        // --- Stan graczy ---
+        // --- Gracze ---
         const playerOne: PlayerState = {
             label: "Player 1",
             colorHex: CONFIG.COLORS.playerOneHex,
             angleRadians: 0,
             positionPixels: {x: 0, y: 0},
             recentPositions: [],
+            gapCorridor: [],
             isAlive: true,
             scoreSeconds: 0,
+            gap: initGapState(),
+            lastRenderedPosition: undefined,
         };
         const playerTwo: PlayerState = {
             label: "Player 2",
@@ -187,8 +304,11 @@ export default function Moving() {
             angleRadians: 0,
             positionPixels: {x: 0, y: 0},
             recentPositions: [],
+            gapCorridor: [],
             isAlive: true,
             scoreSeconds: 0,
+            gap: initGapState(),
+            lastRenderedPosition: undefined,
         };
 
         const pushRecent = (player: PlayerState, point: Vector2D) => {
@@ -198,46 +318,22 @@ export default function Moving() {
             }
         };
 
-        // --- Wejście z klawiatury ---
-        const pressedKeys = new Set<string>();
-
-        const handleKeyDown = (event: KeyboardEvent) => {
-            const key = event.key.toLowerCase();
-
-            if (key === CONFIG.INPUT.toggleMovementKey) {
-                event.preventDefault();
-                // jeśli po śmierci – ignoruj SPACE; czekamy na restart
-                if (gameOverText) return;
-                isMoving = !isMoving;
-                setHud((h) => ({...h, isRunning: isMoving, statusText: isMoving ? "" : "Paused (SPACE)"}));
-                return;
+        const pushGapCorridor = (player: PlayerState, point: Vector2D) => {
+            player.gapCorridor.push(point);
+            if (player.gapCorridor.length > CONFIG.GAPS.corridorMaxPoints) {
+                player.gapCorridor.splice(0, player.gapCorridor.length - CONFIG.GAPS.corridorMaxPoints);
             }
-
-            if (key === CONFIG.INPUT.restartKey) {
-                event.preventDefault();
-                restartGame(); // 🔁 restart zawsze: czyści planszę i losuje pozycje
-                return;
-            }
-
-            pressedKeys.add(key);
         };
 
-        const handleKeyUp = (event: KeyboardEvent) => {
-            const key = event.key.toLowerCase();
-            if (key === CONFIG.INPUT.toggleMovementKey) {
-                event.preventDefault();
-                return;
-            }
-            pressedKeys.delete(key);
-        };
-
-        // --- Canvas, tło, losowe starty ---
+        // --- Tło + ramka ---
         const paintBackground = (widthCssPixels: number, heightCssPixels: number) => {
             canvasContext.fillStyle = CONFIG.COLORS.backgroundHex;
             canvasContext.fillRect(0, 0, widthCssPixels, heightCssPixels);
+            drawBorder(canvasContext, widthCssPixels, heightCssPixels);
         };
 
-        const setCanvasSizeForHiDPIAndInitPositions = () => {
+        // --- Reset rundy (również na start i resize) ---
+        const resetRound = () => {
             const devicePixelRatioSafe = Math.max(1, window.devicePixelRatio || 1);
             const widthCssPixels = window.innerWidth;
             const heightCssPixels = window.innerHeight;
@@ -253,40 +349,64 @@ export default function Moving() {
 
             const radius = CONFIG.DOT.radiusPixels;
 
-            // Losowe pozycje początkowe
+            // Losowe starty w bezpiecznym obszarze (nie na ramce)
+            const t = CONFIG.BORDER.thicknessPixels;
+            const inset = CONFIG.BORDER.insetPixels;
+            const minX = inset + t + radius;
+            const maxX = widthCssPixels - inset - t - radius;
+            const minY = inset + t + radius;
+            const maxY = heightCssPixels - inset - t - radius;
+
             playerOne.positionPixels = {
-                x: radius + Math.random() * (widthCssPixels - 2 * radius),
-                y: radius + Math.random() * (heightCssPixels - 2 * radius),
+                x: minX + Math.random() * (maxX - minX),
+                y: minY + Math.random() * (maxY - minY),
             };
             playerTwo.positionPixels = {
-                x: radius + Math.random() * (widthCssPixels - 2 * radius),
-                y: radius + Math.random() * (heightCssPixels - 2 * radius),
+                x: minX + Math.random() * (maxX - minX),
+                y: minY + Math.random() * (maxY - minY),
             };
 
-            // Zerowanie stanów
+            // Reset stanów
             playerOne.angleRadians = 0;
             playerTwo.angleRadians = 0;
             playerOne.recentPositions.length = 0;
             playerTwo.recentPositions.length = 0;
+            playerOne.gapCorridor.length = 0;
+            playerTwo.gapCorridor.length = 0;
             playerOne.isAlive = true;
             playerTwo.isAlive = true;
             playerOne.scoreSeconds = 0;
             playerTwo.scoreSeconds = 0;
-            isMoving = false;
-            gameOverText = "";
+            playerOne.gap = initGapState();
+            playerTwo.gap = initGapState();
+            playerOne.lastRenderedPosition = undefined;
+            playerTwo.lastRenderedPosition = undefined;
 
-            // Narysuj punkty startowe i zaznacz maskę
+            isMoving = false;
+            hasRoundEnded = false;
+
+            // Zaznacz startowe punkty i narysuj głowy
             drawDot(canvasContext, playerOne.positionPixels, radius, playerOne.colorHex);
             drawDot(canvasContext, playerTwo.positionPixels, radius, playerTwo.colorHex);
-            markVisitedCircle(trailMask, Math.round(playerOne.positionPixels.x), Math.round(playerOne.positionPixels.y), radius);
-            markVisitedCircle(trailMask, Math.round(playerTwo.positionPixels.x), Math.round(playerTwo.positionPixels.y), radius);
+            markVisitedCircle(
+                trailMask,
+                Math.round(playerOne.positionPixels.x),
+                Math.round(playerOne.positionPixels.y),
+                radius
+            );
+            markVisitedCircle(
+                trailMask,
+                Math.round(playerTwo.positionPixels.x),
+                Math.round(playerTwo.positionPixels.y),
+                radius
+            );
             pushRecent(playerOne, {
                 x: Math.round(playerOne.positionPixels.x),
-                y: Math.round(playerOne.positionPixels.y)
+                y: Math.round(playerOne.positionPixels.y),
             });
             pushRecent(playerTwo, {
                 x: Math.round(playerTwo.positionPixels.x),
-                y: Math.round(playerTwo.positionPixels.y)
+                y: Math.round(playerTwo.positionPixels.y),
             });
 
             setHud({
@@ -297,26 +417,52 @@ export default function Moving() {
             });
         };
 
-        // Restart po śmierci (R)
-        const restartGame = () => {
-            setCanvasSizeForHiDPIAndInitPositions();
+        // --- Input ---
+        const pressedKeys = new Set<string>();
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            const key = event.key.toLowerCase();
+
+            if (key === CONFIG.INPUT.toggleMovementKey) {
+                event.preventDefault();
+                if (hasRoundEnded) return; // po zakończeniu – tylko R
+                isMoving = !isMoving;
+                setHud((h) => ({...h, isRunning: isMoving, statusText: isMoving ? "" : "Paused (SPACE)"}));
+                return;
+            }
+
+            if (key === CONFIG.INPUT.restartKey) {
+                event.preventDefault();
+                resetRound(); // zawsze restartuje rundę
+                return;
+            }
+
+            pressedKeys.add(key);
         };
 
-        setCanvasSizeForHiDPIAndInitPositions();
-        window.addEventListener("resize", setCanvasSizeForHiDPIAndInitPositions);
+        const handleKeyUp = (event: KeyboardEvent) => {
+            const key = event.key.toLowerCase();
+            if (key === CONFIG.INPUT.toggleMovementKey) {
+                event.preventDefault();
+                return;
+            }
+            pressedKeys.delete(key);
+        };
+
+        // Init + eventy
+        resetRound();
         window.addEventListener("keydown", handleKeyDown);
         window.addEventListener("keyup", handleKeyUp);
+        window.addEventListener("resize", resetRound);
 
         // --- Pętla gry ---
         let lastTimestampMs = performance.now();
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        let hudAccumulatedMs = 0;
 
         const step = (nowMs: number) => {
             const deltaTimeSeconds = (nowMs - lastTimestampMs) / 1000;
             lastTimestampMs = nowMs;
 
-            // Sterowanie kątami
+            // Obrót (działa zawsze)
             if (pressedKeys.has(CONFIG.INPUT.playerOneTurnLeftKey)) {
                 playerOne.angleRadians -= CONFIG.PHYSICS.turnSpeedRadiansPerSecond * deltaTimeSeconds;
             }
@@ -330,67 +476,102 @@ export default function Moving() {
                 playerTwo.angleRadians += CONFIG.PHYSICS.turnSpeedRadiansPerSecond * deltaTimeSeconds;
             }
 
-            if (isMoving) {
+            if (isMoving && !hasRoundEnded) {
                 const radius = CONFIG.DOT.radiusPixels;
-                const widthCssPixels = canvasElement.clientWidth;
-                const heightCssPixels = canvasElement.clientHeight;
+                const w = canvasElement.clientWidth;
+                const h = canvasElement.clientHeight;
+
+                // Zegary gapów (per żyjący gracz)
+                if (playerOne.isAlive) updateGap(playerOne.gap, deltaTimeSeconds);
+                if (playerTwo.isAlive) updateGap(playerTwo.gap, deltaTimeSeconds);
 
                 const advance = (angle: number) => ({
                     dx: Math.cos(angle) * CONFIG.PHYSICS.forwardSpeedPixelsPerSecond * deltaTimeSeconds,
                     dy: Math.sin(angle) * CONFIG.PHYSICS.forwardSpeedPixelsPerSecond * deltaTimeSeconds,
                 });
 
-                // Ruch gracza 1 (tylko jeśli żyje)
+                // Gracz 1
                 if (playerOne.isAlive) {
                     const a1 = advance(playerOne.angleRadians);
-                    let nextX = Math.max(radius, Math.min(widthCssPixels - radius, playerOne.positionPixels.x + a1.dx));
-                    let nextY = Math.max(radius, Math.min(heightCssPixels - radius, playerOne.positionPixels.y + a1.dy));
+                    const nextX = playerOne.positionPixels.x + a1.dx;
+                    const nextY = playerOne.positionPixels.y + a1.dy;
 
-                    const collides = collidesWithTrailExcludingRecent(
-                        trailMask,
-                        {x: Math.round(nextX), y: Math.round(nextY)},
-                        radius,
-                        playerOne.recentPositions,
-                        CONFIG.TRAIL.extraIgnoreMarginPixels
-                    );
-
-                    if (collides) {
+                    // 🔴 kolizja z ramką?
+                    if (hitsBorder(nextX, nextY, w, h, radius)) {
                         playerOne.isAlive = false;
                     } else {
-                        playerOne.positionPixels = {x: nextX, y: nextY};
-                        markVisitedCircle(trailMask, Math.round(nextX), Math.round(nextY), radius);
-                        pushRecent(playerOne, {x: Math.round(nextX), y: Math.round(nextY)});
-                        playerOne.scoreSeconds += deltaTimeSeconds; // <── naliczamy czas indywidualnie
+                        // kolizja ze śladem (ignorujemy świeży ogon i korytarze)
+                        const ignorePointsP1 = playerOne.recentPositions
+                            .concat(playerOne.gapCorridor)
+                            .concat(playerTwo.gapCorridor);
+
+                        const collides = collidesWithTrailExcludingPoints(
+                            trailMask,
+                            {x: Math.round(nextX), y: Math.round(nextY)},
+                            radius,
+                            ignorePointsP1,
+                            Math.max(CONFIG.TRAIL.extraIgnoreMarginPixels, CONFIG.GAPS.corridorExtraMarginPixels)
+                        );
+
+                        if (collides) {
+                            playerOne.isAlive = false;
+                        } else {
+                            playerOne.positionPixels = {x: nextX, y: nextY};
+
+                            if (!playerOne.gap.isActive) {
+                                markVisitedCircle(trailMask, Math.round(nextX), Math.round(nextY), radius);
+                                pushRecent(playerOne, {x: Math.round(nextX), y: Math.round(nextY)});
+                            } else {
+                                pushGapCorridor(playerOne, {x: Math.round(nextX), y: Math.round(nextY)});
+                            }
+
+                            playerOne.scoreSeconds += deltaTimeSeconds;
+                        }
                     }
                 }
 
-                // Ruch gracza 2 (tylko jeśli żyje)
+                // Gracz 2
                 if (playerTwo.isAlive) {
                     const a2 = advance(playerTwo.angleRadians);
-                    let nextX = Math.max(radius, Math.min(widthCssPixels - radius, playerTwo.positionPixels.x + a2.dx));
-                    let nextY = Math.max(radius, Math.min(heightCssPixels - radius, playerTwo.positionPixels.y + a2.dy));
+                    const nextX = playerTwo.positionPixels.x + a2.dx;
+                    const nextY = playerTwo.positionPixels.y + a2.dy;
 
-                    const collides = collidesWithTrailExcludingRecent(
-                        trailMask,
-                        {x: Math.round(nextX), y: Math.round(nextY)},
-                        radius,
-                        playerTwo.recentPositions,
-                        CONFIG.TRAIL.extraIgnoreMarginPixels
-                    );
-
-                    if (collides) {
+                    if (hitsBorder(nextX, nextY, w, h, radius)) {
                         playerTwo.isAlive = false;
                     } else {
-                        playerTwo.positionPixels = {x: nextX, y: nextY};
-                        markVisitedCircle(trailMask, Math.round(nextX), Math.round(nextY), radius);
-                        pushRecent(playerTwo, {x: Math.round(nextX), y: Math.round(nextY)});
-                        playerTwo.scoreSeconds += deltaTimeSeconds; // <── naliczamy czas indywidualnie
+                        const ignorePointsP2 = playerTwo.recentPositions
+                            .concat(playerTwo.gapCorridor)
+                            .concat(playerOne.gapCorridor);
+
+                        const collides = collidesWithTrailExcludingPoints(
+                            trailMask,
+                            {x: Math.round(nextX), y: Math.round(nextY)},
+                            radius,
+                            ignorePointsP2,
+                            Math.max(CONFIG.TRAIL.extraIgnoreMarginPixels, CONFIG.GAPS.corridorExtraMarginPixels)
+                        );
+
+                        if (collides) {
+                            playerTwo.isAlive = false;
+                        } else {
+                            playerTwo.positionPixels = {x: nextX, y: nextY};
+
+                            if (!playerTwo.gap.isActive) {
+                                markVisitedCircle(trailMask, Math.round(nextX), Math.round(nextY), radius);
+                                pushRecent(playerTwo, {x: Math.round(nextX), y: Math.round(nextY)});
+                            } else {
+                                pushGapCorridor(playerTwo, {x: Math.round(nextX), y: Math.round(nextY)});
+                            }
+
+                            playerTwo.scoreSeconds += deltaTimeSeconds;
+                        }
                     }
                 }
 
-                // Jeśli obaj martwi → koniec rundy
+                // Koniec rundy jeśli obaj martwi
                 if (!playerOne.isAlive && !playerTwo.isAlive) {
                     isMoving = false;
+                    hasRoundEnded = true;
                     setHud((h) => ({
                         ...h,
                         isRunning: false,
@@ -399,16 +580,17 @@ export default function Moving() {
                 }
             }
 
-            // Rysowanie kropek
-            drawDot(canvasContext, playerOne.positionPixels, CONFIG.DOT.radiusPixels, playerOne.colorHex);
-            drawDot(canvasContext, playerTwo.positionPixels, CONFIG.DOT.radiusPixels, playerTwo.colorHex);
+            // Rysowanie głów (w gapie wycieramy poprzednią kropkę, więc ślad się nie tworzy)
+            const radius = CONFIG.DOT.radiusPixels;
+            drawHeadWithGap(canvasContext, playerOne, radius);
+            drawHeadWithGap(canvasContext, playerTwo, radius);
 
-            // Odświeżenie HUD
+            // HUD
             setHud((h) => ({
                 playerOneScore: playerOne.scoreSeconds,
                 playerTwoScore: playerTwo.scoreSeconds,
                 statusText: h.statusText,
-                isRunning: isMoving,
+                isRunning: isMoving && !hasRoundEnded,
             }));
 
             animationFrameRef.current = requestAnimationFrame(step);
@@ -416,18 +598,15 @@ export default function Moving() {
 
         animationFrameRef.current = requestAnimationFrame(step);
 
-        // Sprzątanie
         return () => {
-            window.removeEventListener("resize", setCanvasSizeForHiDPIAndInitPositions);
             window.removeEventListener("keydown", handleKeyDown);
             window.removeEventListener("keyup", handleKeyUp);
+            window.removeEventListener("resize", resetRound);
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         };
     }, []);
 
-    /* =========================
-     * 5) Canvas + HUD
-     * ========================= */
+    // Canvas + HUD
     return (
         <>
             <canvas ref={canvasRef} style={{position: "fixed", inset: 0}}/>
@@ -445,14 +624,12 @@ export default function Moving() {
                 }}
             >
                 <div style={{marginBottom: 4}}>
-                    <span style={{color: CONFIG.COLORS.playerOneHex, fontWeight: 600}}>Player 1</span>
-                    {" • "}
-                    <span>{hud.playerOneScore.toFixed(1)}s</span>
+                    <span style={{color: CONFIG.COLORS.playerOneHex, fontWeight: 600}}>Player 1</span>{" "}
+                    • <span>{hud.playerOneScore.toFixed(1)}s</span>
                 </div>
                 <div>
-                    <span style={{color: CONFIG.COLORS.playerTwoHex, fontWeight: 600}}>Player 2</span>
-                    {" • "}
-                    <span>{hud.playerTwoScore.toFixed(1)}s</span>
+                    <span style={{color: CONFIG.COLORS.playerTwoHex, fontWeight: 600}}>Player 2</span>{" "}
+                    • <span>{hud.playerTwoScore.toFixed(1)}s</span>
                 </div>
             </div>
 
@@ -471,7 +648,7 @@ export default function Moving() {
                 {hud.statusText ? (
                     <div style={{color: CONFIG.COLORS.hudTextHex}}>{hud.statusText}</div>
                 ) : (
-                    <div>Controls: Player1 A/D • Player2 J/K • SPACE start/pause • R restart</div>
+                    <div>Controls: P1 A/D • P2 J/K • SPACE start/pause • R restart</div>
                 )}
             </div>
         </>
